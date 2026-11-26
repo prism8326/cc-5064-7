@@ -55,6 +55,18 @@
     <h2>拾取</h2>
     <div id="pick" class="status">尚未拾取。单击剖切面。</div>
 
+    <h2>局部壳翻面（只改方向表，源网格不变）</h2>
+    <div id="flipbox" class="row">
+      <button id="flipInner">翻转内壳定向</button>
+      <button id="undoFlip" disabled>撤销翻面</button>
+    </div>
+    <div class="note">翻面后截面轮廓形状不变，内部零件身份改变；撤销恢复上一次方向/归属。未裁决的三角汤内壳为「未定向」：填充器仍画它，拾取器不采信。</div>
+
+    <h2>测量线与区段计数</h2>
+    <label><input type="checkbox" id="measureToggle"> 同屏显示测量线覆盖（避腔线 + 穿孔线）</label>
+    <button id="countNow">用相同剖面重新计算区段计数</button>
+    <div class="note">避腔线穿两层外壁却完全避开空腔；穿孔线穿过空腔。区间边界由截线交点确定，实体/空气身份由独立 3D 射线核对，结果见下方状态框。</div>
+
     <h2>导出</h2>
     <button id="export">导出截面轮廓（JSON + SVG）</button>
     <div class="note">范围说明：仅导出平面与源三角面的交线轮廓。剖面封口是模板缓冲的实时渲染效果，<b>未生成可制造的闭合几何</b>；源网格始终保持未切割状态。</div>

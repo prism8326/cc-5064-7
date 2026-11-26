@@ -150,6 +150,71 @@ export async function runSelfTests(app) {
     const same = hashesBefore.every((h, i) => h === hashesAfter[i]);
     T('源网格全程未被修改（渲染前后哈希一致）', same,
       same ? '所有模型 positions/indices 哈希一致' : '哈希发生变化！');
+
+    // ---------- T11 未定向局部壳：填充器仍画几何（绕数跳过其符号），拾取器不采信 ----------
+    app.loadModelById('soup');
+    app.setSemantic('winding');
+    app.setPlane('z', 0);
+    app.setCamera(cam, [0, 0, 0]);
+    const undecidedPick = app.classifyAtClient(pcx, pcy);
+    app.renderOnce();
+    // 壁区仍有封口色（外壳参与计数），但中心含未定向内壳 → 拾取不给实体身份
+    const nWallColor = countColor(CAP.housing);
+    T('未定向三角汤：填充器保留壁区封口，拾取器不采信含未定向壳的实体归属',
+      undecidedPick.cls.kind === 'ambiguous' && nWallColor > 100,
+      `中心拾取=${undecidedPick.cls.kind}，壁区封口像素=${nWallColor}`);
+    // 显式标记未定向：coveragePlan 绕数计数给 SKIP，渲染不报错且拾取仍为空
+    app.markUndetermined(1);
+    app.renderOnce();
+    const skipPick = app.classifyAtClient(pcx, pcy);
+    T('未定向壳在绕数计数中跳过（SKIP），奇偶语义仍可填充',
+      skipPick.cls.kind === 'air',
+      `标记未定向后中心拾取=${skipPick.cls.kind}`);
+
+    // ---------- T12 翻面/撤销重放：轮廓相同，封口计数暂停处与实体拾取身份改变 ----------
+    app.loadModelById('cavity');
+    app.setSemantic('winding');
+    app.setPlane('z', 0);
+    app.renderOnce();
+    const beforeCount = app.sectionCount(8);
+    const beforePick = app.classifyAtClient(pcx, pcy);
+    app.flipInner(1); // 一次翻面更新
+    app.renderOnce();
+    const flippedCount = app.sectionCount(8);
+    const flippedPick = app.classifyAtClient(pcx, pcy);
+    const flippedPixel = renderer.pixel(cx(), cy());
+    app.undoFlip();   // 一次撤销交错抵达
+    app.renderOnce();
+    const undoneCount = app.sectionCount(8);
+    const undonePick = app.classifyAtClient(pcx, pcy);
+    T('翻面/撤销重放：三次截面轮廓段数相同；翻面后中心可拾取内件，撤销恢复空气',
+      beforeCount.contourCount === flippedCount.contourCount
+        && flippedCount.contourCount === undoneCount.contourCount
+        && beforePick.cls.kind === 'air'
+        && flippedPick.cls.kind === 'solid' && flippedPick.cls.name === '翻面内件'
+        && match(flippedPixel, CAP.insert)
+        && undonePick.cls.kind === 'air',
+      `段数 ${beforeCount.contourCount}=${flippedCount.contourCount}=${undoneCount.contourCount}；拾取 ${beforePick.cls.kind}→${flippedPick.cls.name}→${undonePick.cls.kind}`);
+
+    // ---------- T13 测量线：避腔线翻转前后有效覆盖区间原样保留，穿孔线身份改变 ----------
+    app.loadModelById('cavity');
+    app.setPlane('z', 0);
+    app.setMeasure(true);
+    const rep0 = app.measureReport();
+    const avoid0 = rep0.find((r) => r.id === 'avoid');
+    const pierce0 = rep0.find((r) => r.id === 'pierce');
+    app.flipInner(1);
+    const rep1 = app.measureReport();
+    const avoid1 = rep1.find((r) => r.id === 'avoid');
+    const pierce1 = rep1.find((r) => r.id === 'pierce');
+    app.undoFlip();
+    app.setMeasure(false);
+    const sig = (r) => r.intervals.map((i) => `${i.kind}:${i.part}:${i.t0.toFixed(3)}-${i.t1.toFixed(3)}`).join('|');
+    const pierceHasAir = pierce0.intervals.some((i) => i.kind === 'air');
+    const pierceAllSolid = pierce1.intervals.every((i) => i.kind === 'solid');
+    T('测量线覆盖：避腔线区间翻转后原样保留；穿孔线由含空腔变为全实体',
+      sig(avoid0) === sig(avoid1) && pierceHasAir && pierceAllSolid,
+      `避腔线 ${sig(avoid0)}；穿孔线 空气段=${pierceHasAir}→全实体=${pierceAllSolid}`);
   } finally {
     renderer.debug.stencilAlways = false;
     renderer.debug.capNoDepth = false;

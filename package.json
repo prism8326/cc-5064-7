@@ -1,0 +1,11 @@
+{
+  "name": "section-renderer",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "实体剖面实时预览器：方向判定 / 截面覆盖求值 / 填充着色三段式重构",
+  "scripts": {
+    "test": "node --test 'test/**/*.test.mjs'",
+    "section": "node src/section_cli.js"
+  }
+}

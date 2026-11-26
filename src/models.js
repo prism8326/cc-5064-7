@@ -2,7 +2,8 @@
 import { signedVolume } from './geom.js';
 
 // 外定向（CCW）盒：24 顶点（每面独立法线）+ 12 三角形；reverse=true 时逐三角形反转绕序
-function boxShell(cx, cy, cz, s, reverse = false) {
+// mirrorX=true 时仅镜像几何 x 坐标（保持绕序索引不变 → 有符号体积变号），外壳可保持原位
+function boxShell(cx, cy, cz, s, reverse = false, mirrorX = false) {
   const h = s / 2;
   const faces = [
     { n: [1, 0, 0],  q: [[1, -1, -1], [1, 1, -1], [1, 1, 1], [1, -1, 1]] },
@@ -16,7 +17,8 @@ function boxShell(cx, cy, cz, s, reverse = false) {
   for (const f of faces) {
     const base = positions.length / 3;
     for (const q of f.q) {
-      positions.push(cx + q[0] * h, cy + q[1] * h, cz + q[2] * h);
+      const gx = mirrorX ? -q[0] : q[0];
+      positions.push(cx + gx * h, cy + q[1] * h, cz + q[2] * h);
       normals.push(...(reverse ? f.n.map((x) => -x) : f.n));
     }
     const t = reverse ? [0, 2, 1, 0, 3, 2] : [0, 1, 2, 0, 2, 3];
@@ -30,7 +32,7 @@ function combine(id, label, signed, shellDefs, partDefs) {
   const positions = [], normals = [], indices = [];
   const shells = [];
   for (const sd of shellDefs) {
-    const mesh = boxShell(sd.box[0], sd.box[1], sd.box[2], sd.box[3], !!sd.flip);
+    const mesh = boxShell(sd.box[0], sd.box[1], sd.box[2], sd.box[3], !!sd.flip, !!sd.mirrorX);
     const vBase = positions.length / 3;
     const iBase = indices.length;
     positions.push(...mesh.positions);
@@ -42,6 +44,7 @@ function combine(id, label, signed, shellDefs, partDefs) {
       start: iBase,
       count: mesh.indices.length,
       correction: 1,
+      oriented: true, // 构建期默认已定向；未签名三角汤在 finalizeOrientation 中按需置 false
       volume: 0,
     });
   }
@@ -64,6 +67,7 @@ function combine(id, label, signed, shellDefs, partDefs) {
   // 快照运行时元数据，便于“重新加载”撤销用户裁决（源网格数组本身永不被修改）
   model._pristine = {
     corrections: shells.map((s) => s.correction),
+    oriented: shells.map((s) => s.oriented),
     ambiguous: model.ambiguous,
     parts: model.parts.map((p) => ({ ...p, shells: p.shells.slice() })),
     implicitPart: model.implicitPart,
@@ -74,10 +78,54 @@ function combine(id, label, signed, shellDefs, partDefs) {
 // 撤销用户裁决，恢复构建时的壳符号与零件归属
 export function resetModel(model) {
   const p = model._pristine;
-  model.shells.forEach((s, i) => (s.correction = p.corrections[i]));
+  model.shells.forEach((s, i) => {
+    s.correction = p.corrections[i];
+    s.oriented = p.oriented[i];
+  });
   model.ambiguous = p.ambiguous;
   model.parts = p.parts.map((x) => ({ ...x, shells: x.shells.slice() }));
   model.implicitPart = p.implicitPart;
+  delete model._partDepths;
+}
+
+// 方向快照/恢复：翻面更新与撤销交错抵达时逐帧重放用（独立于 resetModel）。
+export function snapshotOrientation(model) {
+  return {
+    shells: model.shells.map((s) => ({ correction: s.correction, oriented: s.oriented })),
+    parts: model.parts.map((p) => ({ name: p.name, color: p.color.slice(), capColor: p.capColor.slice(), shells: p.shells.slice() })),
+    ambiguous: model.ambiguous,
+  };
+}
+export function restoreOrientation(model, snap) {
+  model.shells.forEach((s, i) => {
+    s.correction = snap.shells[i].correction;
+    s.oriented = snap.shells[i].oriented;
+  });
+  model.parts = snap.parts.map((p) => ({ name: p.name, color: p.color.slice(), capColor: p.capColor.slice(), shells: p.shells.slice() }));
+  model.ambiguous = snap.ambiguous;
+  delete model._partDepths;
+}
+
+// 翻转一个局部壳的有效定向（只改元数据，源网格不变）。
+// 空腔壳翻成实体壳时把它拆为独立零件：轮廓形状不变，内部零件身份改变。
+const FLIP_COLOR = { color: [0.25, 0.62, 0.68], capColor: [0.15, 0.85, 0.9] };
+export function flipShell(model, shellIndex) {
+  const s = model.shells[shellIndex];
+  s.correction = -s.correction;
+  s.oriented = true;
+  const owner = model.parts.find((p) => p.shells.includes(shellIndex));
+  if (owner && owner.shells.length > 1) {
+    owner.shells = owner.shells.filter((si) => si !== shellIndex);
+    model.parts.push({ name: '翻面内件', ...FLIP_COLOR, shells: [shellIndex] });
+  }
+  model.ambiguous = false;
+  delete model._partDepths;
+}
+
+// 把局部壳标记为未定向（填充器仍可接收其几何；拾取器不采信归属）。
+export function markUndetermined(model, shellIndex) {
+  model.shells[shellIndex].oriented = false;
+  delete model._partDepths;
 }
 
 // 定向分析：
@@ -109,6 +157,9 @@ function finalizeOrientation(model) {
         );
       }
     } else if (actual !== expected) {
+      // 未签名且与期望定向不符：无法区分空腔与嵌入实心件 → 未定向局部壳。
+      // 填充器可接收该几何（绕数语义下跳过其符号计数），拾取器不采信其归属，等待用户裁决。
+      s.oriented = false;
       model.ambiguous = true;
     }
   });
@@ -160,6 +211,15 @@ export function buildModels() {
         { box: [0, 0, 0, 2], name: '外壳', role: 'solid' },
         // 数据层面未反转（体积为正），但签名资料声明它是空腔 → 自动 correction=-1
         { box: [0, 0, 0, 1], name: '空腔壳（数据绕序错误）', role: 'void' },
+      ],
+      [{ name: '外壳体', color: C.housing, capColor: C.housingCap, shells: [0, 1] }]
+    ),
+    combine(
+      'mirror', '镜像内壳（仅内壳镜像，外壳原位；截面可从相切拖到相交）', true,
+      [
+        { box: [0, 0, 0, 2], name: '外壳', role: 'solid' },
+        // 镜像几何使有符号体积变号；签名资料仍声明为空腔，correction 把逻辑定向校正回空腔
+        { box: [0, 0, 0, 1], name: '镜像内壳', role: 'void', mirrorX: true },
       ],
       [{ name: '外壳体', color: C.housing, capColor: C.housingCap, shells: [0, 1] }]
     ),

@@ -193,8 +193,11 @@ export function rayCrossings(model, shellIndices, point, dirIndex = 0) {
 
 // 壳的有效定向符号 = 元数据校正系数。
 // 数据绕序本身已由 GL 正背面 / CPU 行列式表达；correction 仅在校验发现数据与可信资料不符时为 -1。
+// 未定向壳（oriented===false）返回 0：填充器可接收该壳的几何，但绕数计数跳过其符号，
+// 拾取器不会据此采信任何实体归属（方向判定表见 orientation.js）。
 export function shellEffSign(model, shellIndex) {
-  return model.shells[shellIndex].correction;
+  const s = model.shells[shellIndex];
+  return s.oriented === false ? 0 : s.correction;
 }
 
 // 每个零件在指定点的绕数（相机补偿、拾取共用）
@@ -230,41 +233,6 @@ export function classifyPoint(model, point, semantic) {
   }
   if (best === null) return { kind: 'air' };
   return { kind: 'solid', part: best, name: model.parts[best].name };
-}
-
-// ---------- 截面交线（导出用；只读源网格，不修改） ----------
-export function trianglePlaneSegment(a, b, c, n, d) {
-  const pts = [a, b, c];
-  const f = pts.map((p) => V.dot(n, p) + d);
-  const out = [];
-  for (let i = 0; i < 3; i++) {
-    const j = (i + 1) % 3;
-    const fi = f[i], fj = f[j];
-    if (fi === 0 && fj === 0) continue; // 共面边：忽略（相邻三角形会提供线段）
-    if (fi * fj < 0) out.push(V.mix(pts[i], pts[j], fi / (fi - fj)));
-    else if (fi === 0) out.push(pts[i]);
-  }
-  // 去重（顶点恰在平面上时可能重复）
-  const uniq = [];
-  for (const p of out)
-    if (!uniq.some((q) => V.len(V.sub(p, q)) < 1e-9)) uniq.push(p);
-  return uniq.length === 2 ? uniq : null;
-}
-
-export function sectionSegments(model, n, d) {
-  const segs = [];
-  const shellPart = new Array(model.shells.length).fill(-1);
-  model.parts.forEach((p, pi) => p.shells.forEach((si) => (shellPart[si] = pi)));
-  model.shells.forEach((s, si) => {
-    for (let i = s.start; i < s.start + s.count; i += 3) {
-      const a = triVertex(model.positions, model.indices[i]);
-      const b = triVertex(model.positions, model.indices[i + 1]);
-      const c = triVertex(model.positions, model.indices[i + 2]);
-      const seg = trianglePlaneSegment(a, b, c, n, d);
-      if (seg) segs.push({ part: shellPart[si], a: seg[0], b: seg[1] });
-    }
-  });
-  return segs;
 }
 
 // 平面正交基（SVG 投影、平面边框显示用）

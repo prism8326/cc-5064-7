@@ -2,9 +2,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  V, signedVolume, rayPlane, rayCrossings, classifyPoint, sectionSegments,
-  trianglePlaneSegment, pointTriangleDistance, cameraWinding, hashMesh, planeBasis,
+  V, signedVolume, rayPlane, rayCrossings, classifyPoint,
+  pointTriangleDistance, cameraWinding, hashMesh, planeBasis,
 } from '../src/geom.js';
+import { sectionContours, trianglePlaneSegment } from '../src/section.js';
 import { buildModels } from '../src/models.js';
 
 const models = buildModels();
@@ -84,16 +85,16 @@ test('相机绕数：内部非零、外部为零（模板初值补偿量）', ()
 
 test('截面交线：盒在 z=0 截出 8 段（每侧面 2 三角形），端点落在 |x|=1 或 |y|=1', () => {
   const m = byId('solid');
-  const segs = sectionSegments(m, [0, 0, 1], 0);
-  assert.equal(segs.length, 8);
-  for (const s of segs)
+  const { segments } = sectionContours(m, [0, 0, 1], 0);
+  assert.equal(segments.length, 8);
+  for (const s of segments)
     for (const p of [s.a, s.b]) {
       assert.ok(Math.abs(p[2]) < 1e-6, '交点应在平面上');
       assert.ok(Math.abs(Math.abs(p[0]) - 1) < 1e-6 || Math.abs(Math.abs(p[1]) - 1) < 1e-6);
     }
   // 空腔盒：外壳 8 段 + 空腔壳 8 段（孔洞轮廓同样导出，不用矩形掩盖）
-  const cavSegs = sectionSegments(byId('cavity'), [0, 0, 1], 0);
-  assert.equal(cavSegs.length, 16);
+  const cav = sectionContours(byId('cavity'), [0, 0, 1], 0);
+  assert.equal(cav.count, 16);
 });
 
 test('三角形-平面求交：不相交返回 null', () => {

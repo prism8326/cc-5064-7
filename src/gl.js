@@ -1,11 +1,15 @@
-// WebGL2 剖面渲染管线。
-// 每帧明确的通道顺序（深度/模板顺序分析见 UI 实现说明）：
+// WebGL2 剖面渲染管线。三个阶段各自有明确输入/输出（纯 CPU 方案见 section.js / orientation.js）：
+//   阶段 A 朝向判定：输入壳元数据 → shellEffSign 有效符号（未定向壳=0），决定计数通道操作
+//   阶段 B 截面模板计数：输入方向表+平面+相机绕数 → 逐零件模板掩码（孔洞处计数为 0）
+//   阶段 C 填充着色：输入模板掩码+零件颜色 → 平面真实深度上的封口，颜色只在这一阶段生效
+// 通道顺序：
 //   1) 保留侧几何：颜色+深度（clip 由 fragment discard 实现，源网格不变）
-//   2) 平面边框线
+//   2) 平面边框 / 测量线覆盖（测量线的区间身份由 section.lineCoverage 在 CPU 侧求出）
 //   3) 逐零件：清模板为“相机绕数”初值 → 仅相机侧壳面做模板计数（前+1/后-1 或 INVERT）
 //      → 模板!=0 处画封口全屏三角形（逐像素求平面深度，LEQUAL 写深度）
 //   4) 拾取标记
 import { V, M4, cameraWinding, shellEffSign, planeBasis, partDepths } from './geom.js';
+import { shellIsOriented } from './orientation.js';
 
 const VS_MESH = `#version 300 es
 layout(location=0) in vec3 aPos;
@@ -196,7 +200,8 @@ export class Renderer {
 
   // cam: {eye, center, up, fov, near, far}
   // plane: {n, d}; semantic: 'winding'|'parity'; selection: 零件索引或 -1
-  render(cam, plane, semantic, selection, marker) {
+  // measure: null 或 [{ line:{p,q}, intervals:[{t0,t1,kind,part}] }]（CPU 侧 section.lineCoverage 结果）
+  render(cam, plane, semantic, selection, marker, measure) {
     const gl = this.gl, model = this.model;
     this.resize();
     const aspect = this.canvas.width / this.canvas.height;
@@ -206,8 +211,6 @@ export class Renderer {
     const invVP = M4.invert(vp);
     const fCam = V.dot(plane.n, cam.eye) + plane.d;
     const camSide = fCam >= 0 ? 1 : -1;
-    const camW = cameraWinding(model, cam.eye, semantic); // 每零件模板初值
-    this.lastInfo = { camW: camW.slice(), camSide, fCam };
 
     gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     gl.clearColor(0.08, 0.09, 0.11, 1);
@@ -217,7 +220,35 @@ export class Renderer {
     gl.disable(gl.CULL_FACE);
     gl.disable(gl.BLEND);
 
-    // ---- 1) 保留侧几何：颜色+深度 ----
+    // 阶段 A/B/C 共用的方向表：朝向判定的唯一来源（未定向壳 countSign=0）
+    this.orientation = model.shells.map((s, si) => ({
+      shell: si,
+      oriented: shellIsOriented(model, si),
+      countSign: shellEffSign(model, si),
+    }));
+
+    // ---- 阶段 C-几何：保留侧几何写颜色+深度（裁剪只 discard 片元，源网格不变） ----
+    this.drawRetainedGeometry(vp, plane, cam);
+    this.drawPlaneOutline(vp, plane);
+    if (measure) for (const m of measure) this.drawMeasureOverlay(vp, m);
+
+    // ---- 阶段 A→B→C 封口：朝向判定 → 模板计数 → 掩码驱动填充 ----
+    const camW = cameraWinding(model, cam.eye, semantic); // 每零件模板初值
+    this.lastInfo = { camW: camW.slice(), camSide, fCam };
+    const parity = semantic === 'parity';
+    for (const pi of this._partOrder)
+      this.fillPartCap(pi, vp, invVP, plane, cam, semantic, parity, camSide, camW[pi], selection);
+    gl.depthFunc(gl.LESS);
+
+    // ---- 拾取标记 ----
+    if (marker) this.drawMarker(vp, marker);
+    gl.colorMask(true, true, true, true);
+    gl.depthMask(true);
+  }
+
+  // 阶段 C-几何：保留侧（f>0）网格，仅写颜色/深度
+  drawRetainedGeometry(vp, plane, cam) {
+    const gl = this.gl, model = this.model;
     gl.useProgram(this.pMesh);
     gl.uniformMatrix4fv(this.uMesh.uVP, false, vp);
     gl.uniform3fv(this.uMesh.uPlaneN, plane.n);
@@ -229,87 +260,86 @@ export class Renderer {
     gl.depthMask(true);
     gl.disable(gl.STENCIL_TEST);
     this.bindMeshBuffers(true);
-    for (const [pi, part] of model.parts.entries()) {
-      const dim = 0.55;
-      gl.uniform3fv(this.uMesh.uColor, part.color.map((c) => c * dim));
+    for (const part of model.parts) {
+      gl.uniform3fv(this.uMesh.uColor, part.color.map((c) => c * 0.55));
       for (const si of part.shells) {
         const s = model.shells[si];
         gl.drawElements(gl.TRIANGLES, s.count, gl.UNSIGNED_INT, s.start * 4);
       }
     }
+  }
 
-    // ---- 2) 平面边框 ----
-    this.drawPlaneOutline(vp, plane);
-
-    // ---- 3) 逐零件：模板计数 + 封口 ----
-    const parity = semantic === 'parity';
-    for (const pi of this._partOrder) {
-      const part = model.parts[pi];
-      // 3a) 模板初值 = 相机对该零件的绕数（相机在实体内的显式补偿）
-      gl.clearStencil(camW[pi] & 0xff);
-      gl.stencilMask(0xff);
-      gl.clear(gl.STENCIL_BUFFER_BIT);
-
-      // 3b) 计数：只统计相机侧（被裁掉一侧）的壳面；关闭深度——计数与遮挡无关
-      gl.useProgram(this.pCount);
-      gl.uniformMatrix4fv(this.uCount.uVP, false, vp);
-      gl.uniform3fv(this.uCount.uPlaneN, plane.n);
-      gl.uniform1f(this.uCount.uPlaneD, plane.d);
-      gl.uniform1f(this.uCount.uSide, camSide);
-      gl.colorMask(false, false, false, false);
-      gl.depthMask(false);
-      gl.disable(gl.DEPTH_TEST);
-      gl.enable(gl.STENCIL_TEST);
-      gl.stencilFunc(gl.ALWAYS, 0, 0xff);
-      this.bindMeshBuffers(false);
-      for (const si of part.shells) {
-        const s = model.shells[si];
-        const eff = shellEffSign(model, si);
-        if (parity) {
-          gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.INVERT);
-          gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.INVERT);
-        } else {
-          // 绕数：w(平面点) = w(相机) − 沿途穿越数 → 正面 DECR / 背面 INCR；
-          // 壳有效定向为负（correction=-1）时交换
-          const opF = eff > 0 ? gl.DECR_WRAP : gl.INCR_WRAP;
-          const opB = eff > 0 ? gl.INCR_WRAP : gl.DECR_WRAP;
-          gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, opF);
-          gl.stencilOpSeparate(gl.BACK, gl.KEEP,  gl.KEEP, opB);
-        }
-        gl.drawElements(gl.TRIANGLES, s.count, gl.UNSIGNED_INT, s.start * 4);
+  // 阶段 A→B：一个零件的模板计数（输入方向表与相机绕数，输出模板掩码，不写颜色/深度）
+  countPartStencil(part, vp, plane, parity, camSide, cameraWinding) {
+    const gl = this.gl, model = this.model;
+    gl.clearStencil(cameraWinding & 0xff);
+    gl.stencilMask(0xff);
+    gl.clear(gl.STENCIL_BUFFER_BIT);
+    gl.useProgram(this.pCount);
+    gl.uniformMatrix4fv(this.uCount.uVP, false, vp);
+    gl.uniform3fv(this.uCount.uPlaneN, plane.n);
+    gl.uniform1f(this.uCount.uPlaneD, plane.d);
+    gl.uniform1f(this.uCount.uSide, camSide);
+    gl.colorMask(false, false, false, false);
+    gl.depthMask(false);
+    gl.disable(gl.DEPTH_TEST);
+    gl.enable(gl.STENCIL_TEST);
+    gl.stencilFunc(gl.ALWAYS, 0, 0xff);
+    this.bindMeshBuffers(false);
+    for (const si of part.shells) {
+      const s = model.shells[si];
+      const eff = shellEffSign(model, si);
+      if (parity) {
+        gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.INVERT);
+        gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.INVERT);
+      } else if (eff === 0) {
+        // 未定向局部壳：填充器接收几何但绕数语义下不采信方向 → 跳过其符号计数
+        gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, gl.KEEP);
+        gl.stencilOpSeparate(gl.BACK, gl.KEEP, gl.KEEP, gl.KEEP);
+      } else {
+        // w(平面点) = w(相机) − 沿途穿越数 → 正面 DECR / 背面 INCR；壳定向为负时交换
+        const opF = eff > 0 ? gl.DECR_WRAP : gl.INCR_WRAP;
+        const opB = eff > 0 ? gl.INCR_WRAP : gl.DECR_WRAP;
+        gl.stencilOpSeparate(gl.FRONT, gl.KEEP, gl.KEEP, opF);
+        gl.stencilOpSeparate(gl.BACK, gl.KEEP,  gl.KEEP, opB);
       }
-
-      // 3c) 封口：模板 != 0（奇偶语义看 bit0）处，把全屏三角形钉在平面深度上
-      gl.useProgram(this.pCap);
-      gl.uniformMatrix4fv(this.uCap.uVP, false, vp);
-      gl.uniformMatrix4fv(this.uCap.uInvVP, false, invVP);
-      gl.uniform3fv(this.uCap.uCamPos, cam.eye);
-      gl.uniform3fv(this.uCap.uPlaneN, plane.n);
-      gl.uniform1f(this.uCap.uPlaneD, plane.d);
-      const capColor = pi === selection
-        ? part.capColor.map((c) => Math.min(1, c * 1.25 + 0.15))
-        : part.capColor;
-      gl.uniform3fv(this.uCap.uColor, capColor);
-      gl.colorMask(true, true, true, true);
-      gl.depthMask(true);
-      if (this.debug.capNoDepth) gl.disable(gl.DEPTH_TEST);
-      else { gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); }
-      if (this.debug.stencilAlways) gl.stencilFunc(gl.ALWAYS, 0, 0xff); // 自检：退化为整块矩形
-      else gl.stencilFunc(gl.NOTEQUAL, 0, parity ? 0x01 : 0xff);
-      gl.stencilMask(0x00);
-      gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
-      gl.bindBuffer(gl.ARRAY_BUFFER, this.vboFull);
-      gl.enableVertexAttribArray(0);
-      gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
-      gl.drawArrays(gl.TRIANGLES, 0, 3);
-      gl.disable(gl.STENCIL_TEST);
+      gl.drawElements(gl.TRIANGLES, s.count, gl.UNSIGNED_INT, s.start * 4);
     }
-    gl.depthFunc(gl.LESS);
+  }
 
-    // ---- 4) 拾取标记 ----
-    if (marker) this.drawMarker(vp, marker);
+  // 阶段 C：模板掩码驱动的封口填充（颜色只在此阶段生效，写平面真实深度）
+  drawCapFill(pi, vp, invVP, plane, cam, parity, selection) {
+    const gl = this.gl, part = this.model.parts[pi];
+    gl.useProgram(this.pCap);
+    gl.uniformMatrix4fv(this.uCap.uVP, false, vp);
+    gl.uniformMatrix4fv(this.uCap.uInvVP, false, invVP);
+    gl.uniform3fv(this.uCap.uCamPos, cam.eye);
+    gl.uniform3fv(this.uCap.uPlaneN, plane.n);
+    gl.uniform1f(this.uCap.uPlaneD, plane.d);
+    const capColor = pi === selection
+      ? part.capColor.map((c) => Math.min(1, c * 1.25 + 0.15))
+      : part.capColor;
+    gl.uniform3fv(this.uCap.uColor, capColor);
     gl.colorMask(true, true, true, true);
     gl.depthMask(true);
+    if (this.debug.capNoDepth) gl.disable(gl.DEPTH_TEST);
+    else { gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL); }
+    if (this.debug.stencilAlways) gl.stencilFunc(gl.ALWAYS, 0, 0xff); // 自检：退化为整块矩形
+    else gl.stencilFunc(gl.NOTEQUAL, 0, parity ? 0x01 : 0xff);
+    gl.stencilMask(0x00);
+    gl.stencilOp(gl.KEEP, gl.KEEP, gl.KEEP);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboFull);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.disable(gl.STENCIL_TEST);
+  }
+
+  // 单零件完整封口：B 计数 → C 填充
+  fillPartCap(pi, vp, invVP, plane, cam, semantic, parity, camSide, cameraWinding, selection) {
+    const part = this.model.parts[pi];
+    this.countPartStencil(part, vp, plane, parity, camSide, cameraWinding);
+    this.drawCapFill(pi, vp, invVP, plane, cam, parity, selection);
   }
 
   drawPlaneOutline(vp, plane) {
@@ -335,6 +365,44 @@ export class Renderer {
     gl.disableVertexAttribArray(1);
     gl.drawArrays(gl.LINE_LOOP, 0, 4);
     gl.depthMask(true);
+    gl.disable(gl.BLEND);
+  }
+
+  // 测量线覆盖：区间由 section.lineCoverage（CPU）求出，这里只按结果着色绘制。
+  // 实体区间用零件 capColor，空气区间用灰色；身份未被拾取器采信的区间不会出现 solid。
+  drawMeasureOverlay(vp, measure) {
+    const gl = this.gl;
+    const { p, q } = measure.line;
+    const pts = [];
+    const col = (iv) => {
+      if (iv.kind !== 'solid') return [0.62, 0.62, 0.66, 0.9];
+      const part = this.model.parts[iv.part];
+      return [...(part ? part.capColor : [0.8, 0.8, 0.8]), 1];
+    };
+    for (const iv of measure.intervals) {
+      const a = V.mix(p, q, iv.t0), b = V.mix(p, q, iv.t1);
+      pts.push({ a, b, c: col(iv) });
+    }
+    if (!pts.length) return;
+    const prevDepthMask = gl.getParameter(gl.DEPTH_WRITEMASK);
+    gl.useProgram(this.pFlat);
+    gl.uniformMatrix4fv(this.uFlat.uVP, false, vp);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    gl.depthMask(false);
+    gl.disable(gl.DEPTH_TEST);
+    gl.lineWidth(2);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboDyn);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    gl.disableVertexAttribArray(1);
+    for (const seg of pts) {
+      gl.uniform4fv(this.uFlat.uColor, seg.c);
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([...seg.a, ...seg.b]), gl.DYNAMIC_DRAW);
+      gl.drawArrays(gl.LINES, 0, 2);
+    }
+    gl.enable(gl.DEPTH_TEST);
+    gl.depthMask(prevDepthMask);
     gl.disable(gl.BLEND);
   }
 
